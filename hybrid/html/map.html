@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>地图页</title>
+  <script>
+    window._AMapSecurityConfig = {
+      securityJsCode: '5de8c697f78f5f887c1552596625bf6e'
+    };
+  </script>
+  <script src="https://webapi.amap.com/maps?v=2.0&key=6d6e76111b65a7f1f68e122a6b204317"></script>
+  <style>
+    html, body, #map {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script>
+    const center = [110.152305, 19.99839]
+    const volunteersData = [
+      { id: 1, name: '王秀兰', position: [110.1529, 19.9988] },
+      { id: 2, name: '李国成', position: [110.1518, 19.9981] },
+      { id: 3, name: '张秋芳', position: [110.1531, 19.9979] }
+    ]
+
+    let map
+    let meMarker
+    let volunteerMarkers = {}
+    let routeLines = {}
+    let redZone
+    let grayZone
+    let moveTimer = null
+    let volunteerMoveTimers = {}
+
+    function initMap() {
+      map = new AMap.Map('map', {
+        zoom: 17,
+        center,
+        viewMode: '2D'
+      })
+
+      meMarker = new AMap.Marker({
+        position: center,
+        title: '求助者',
+        icon: 'https://webapi.amap.com/theme/v1.3/markers/n/mark_r.png'
+      })
+      map.add(meMarker)
+
+      volunteersData.forEach(v => {
+        const marker = new AMap.Marker({
+          position: v.position,
+          title: v.name,
+          icon: 'https://webapi.amap.com/theme/v1.3/markers/n/mark_b.png'
+        })
+        map.add(marker)
+        volunteerMarkers[v.id] = marker
+      })
+
+      grayZone = new AMap.Circle({
+        center: [110.1517, 19.9987],
+        radius: 180,
+        strokeColor: '#8d99ae',
+        strokeWeight: 2,
+        fillColor: '#8d99ae',
+        fillOpacity: 0.22
+      })
+      map.add(grayZone)
+
+      redZone = new AMap.Circle({
+        center: [110.1530, 19.9992],
+        radius: 120,
+        strokeColor: '#ff4d4f',
+        strokeWeight: 2,
+        fillColor: '#ff4d4f',
+        fillOpacity: 0.28
+      })
+      map.add(redZone)
+    }
+
+    function resetMapScene() {
+      if (moveTimer) {
+        clearInterval(moveTimer)
+        moveTimer = null
+      }
+
+      Object.keys(volunteerMoveTimers).forEach(key => {
+        clearInterval(volunteerMoveTimers[key])
+      })
+      volunteerMoveTimers = {}
+
+      Object.keys(routeLines).forEach(key => {
+        map.remove(routeLines[key])
+      })
+      routeLines = {}
+
+      meMarker.setPosition(center)
+
+      volunteersData.forEach(v => {
+        volunteerMarkers[v.id].setPosition(v.position)
+      })
+
+      map.setZoomAndCenter(17, center)
+    }
+
+    function moveMeToDangerZone() {
+      if (moveTimer) clearInterval(moveTimer)
+
+      let pos = meMarker.getPosition()
+      let lng = pos.lng
+      let lat = pos.lat
+      const target = [110.1530, 19.9992]
+
+      moveTimer = setInterval(() => {
+        lng += (target[0] - lng) * 0.08
+        lat += (target[1] - lat) * 0.08
+        meMarker.setPosition([lng, lat])
+
+        const closeEnough =
+          Math.abs(lng - target[0]) < 0.00005 &&
+          Math.abs(lat - target[1]) < 0.00005
+
+        if (closeEnough) {
+          clearInterval(moveTimer)
+          moveTimer = null
+          meMarker.setPosition(target)
+        }
+      }, 400)
+    }
+
+    function volunteerCome(id) {
+      const marker = volunteerMarkers[id]
+      if (!marker) return
+
+      const pos = marker.getPosition()
+      let lng = pos.lng
+      let lat = pos.lat
+
+      const myPos = meMarker.getPosition()
+      const target = [myPos.lng, myPos.lat]
+
+      const path = [[lng, lat]]
+      const line = new AMap.Polyline({
+        path,
+        strokeColor: '#2d6cff',
+        strokeWeight: 5,
+        strokeOpacity: 0.9,
+        lineJoin: 'round',
+        lineCap: 'round'
+      })
+      map.add(line)
+      routeLines[id] = line
+
+      volunteerMoveTimers[id] = setInterval(() => {
+        lng += (target[0] - lng) * 0.08
+        lat += (target[1] - lat) * 0.08
+
+        marker.setPosition([lng, lat])
+        path.push([lng, lat])
+        line.setPath(path)
+
+        const closeEnough =
+          Math.abs(lng - target[0]) < 0.00005 &&
+          Math.abs(lat - target[1]) < 0.00005
+
+        if (closeEnough) {
+          clearInterval(volunteerMoveTimers[id])
+          marker.setPosition(target)
+        }
+      }, 500)
+    }
+
+    window.addEventListener('message', (event) => {
+      const data = event.data || {}
+      if (!data.type) return
+
+      if (data.type === 'reset') {
+        resetMapScene()
+      }
+
+      if (data.type === 'dangerZoneTest') {
+        resetMapScene()
+        moveMeToDangerZone()
+      }
+
+      if (data.type === 'manualSOS') {
+        resetMapScene()
+      }
+
+      if (data.type === 'dangerTimeTest') {
+        resetMapScene()
+      }
+
+      if (data.type === 'volunteerRespond') {
+        volunteerCome(data.id)
+      }
+    })
+
+    initMap()
+  </script>
+</body>
+</html>
