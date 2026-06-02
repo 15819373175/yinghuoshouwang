@@ -115,8 +115,8 @@
           <view class="vol-top">
             <view>
               <view class="vol-name">{{ item.name }}</view>
-              <view class="vol-meta">{{ item.age }} 岁 · {{ item.job }}</view>
-              <view class="vol-honor">{{ item.honor }}</view>
+              <view class="vol-meta">{{ item.phone || '暂无电话' }}</view>
+              <view class="vol-honor">{{ getVolunteerRole(item) }}</view>
             </view>
             <view
               class="pill"
@@ -162,6 +162,7 @@
 
     <view class="sos-row">
       <view class="sos-btn" @click="handleManualSOS">SOS</view>
+      <view class="help-pill tutorial-pill" @click="goTutorial">使用教程</view>
       <view class="help-pill" @click="handleEndDemo">结束演示</view>
     </view>
 
@@ -204,10 +205,18 @@
           <view class="voice-entry-title">语音检测页</view>
           <view class="voice-entry-desc">录音并上传识别，用于 SOS 关键词联调测试。</view>
         </view>
-        <view class="chip primary voice-entry-btn" @click="goVoiceTest">进入语音检测</view>
+        <view class="voice-entry-actions">
+          <view class="chip primary voice-entry-btn" @click="goVoiceTest">进入语音检测</view>
+          <view
+            class="chip warn voice-entry-btn"
+            @click="voiceModelRunning ? stopVoiceModelDetect() : startVoiceModelDetect(false)"
+          >
+            {{ voiceModelRunning ? '关闭模型监听' : '开启模型监听' }}
+          </view>
+        </view>
       </view>
       <view class="voice-plan-hint">
-        自动监测：在下方选择或智能推荐监测时间点，到达对应时段后系统将自动开启语音监测（演示逻辑，每点起 45 分钟内有效）。
+        自动监测：在下方选择或智能推荐监测时间点，到达对应时段后系统将自动开启语音模型监听；识别到“救命/help”后自动触发 SOS。
       </view>
       <view class="voice-plan-status">{{ voiceScheduleStatusText }}</view>
       <view class="voice-slot-actions">
@@ -235,11 +244,33 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { onShow, onHide } from '@dcloudio/uni-app'
+import { onLoad, onShow, onHide } from '@dcloudio/uni-app'
 
 const CENTER = { latitude: 19.99839, longitude: 110.152305 }
 const STORAGE_KEY = 'sos_task_state_v3'
 const VOICE_SLOTS_KEY = 'voice_monitor_time_slots_v1'
+const VOLUNTEER_PROFILE_KEY = 'volunteerProfile'
+
+// ✅ 后端地址：把 192.168.xx.xx 改成你电脑的 IPv4 地址，端口按你的 server.js 是 5000
+const BASE_URL = 'http://192.168.43.66:5000'
+// ✅ 语音模型后端地址：和 SOS 后端分开
+const VOICE_API_URL = 'http://192.168.43.66:8000/api/detect'
+
+function request(url, method = 'GET', data = {}, token = '') {
+  return new Promise((resolve, reject) => {
+    uni.request({
+      url: BASE_URL + url,
+      method,
+      data,
+      header: {
+        'Content-Type': 'application/json',
+        Authorization: token ? `Bearer ${token}` : ''
+      },
+      success: (res) => resolve(res.data),
+      fail: reject
+    })
+  })
+}
 
 const RED_ZONES = [
   { id: 1, latitude: 19.99892, longitude: 110.15288, radius: 26 },
@@ -265,6 +296,8 @@ const waveBars = ref([24, 36, 20, 42, 28, 38, 22, 34, 26, 30])
 const logs = ref(['系统已启动，正在同步周边风险状态'])
 const volunteers = ref([])
 const isEmergencyMode = ref(false)
+const taskId = ref(null)
+const isCreatingSOS = ref(false)
 const emergencyTriggerType = ref('')
 const emergencyStartedAt = ref(0)
 const emergencySeconds = ref(0)
@@ -274,6 +307,9 @@ const isDangerSimulation = ref(false)
 const voiceMonitorSlots = ref([])
 const pickerTime = ref('22:00')
 const listeningFromSchedule = ref(false)
+const voiceModelRunning = ref(false)
+const voiceModelUploading = ref(false)
+const voiceModelLastSosAt = ref(0)
 
 const emergencySmsPreview =
   '【紧急求助】我可能正处于危险中，当前位置已共享，请尽快联系我或查看定位。'
@@ -283,6 +319,9 @@ let waveTimer = null
 let emergencyClockTimer = null
 let contactNotifyTimers = []
 let dangerTimer = null
+let backendPollTimer = null
+let recorderManager = null
+let recorderEventsBound = false
 
 function defaultEmergencyContacts() {
   return [
@@ -308,17 +347,18 @@ function defaultEmergencyContacts() {
 }
 
 function normalizeEmergencyContacts(incoming = []) {
-  const base = defaultEmergencyContacts()
-  return base.map((item) => {
-    const found = incoming.find((c) => c.id === item.id) || {}
-    return {
-      ...item,
-      ...found,
-      notified: !!found.notified,
-      notifyTime: found.notifyTime || '',
-      status: found.status || '待发送'
-    }
-  })
+  if (Array.isArray(incoming) && incoming.length > 0) {
+    return incoming.map((c, index) => ({
+      id: c.id || index + 1,
+      name: c.name || `联系人${index + 1}`,
+      relation: c.relation || '紧急联系人',
+      phone: c.phone || '',
+      notified: c.status === '发送成功' || !!c.notified,
+      notifyTime: c.notifyTime || c.notify_time || '',
+      status: c.status || '待发送'
+    }))
+  }
+  return defaultEmergencyContacts()
 }
 
 function defaultVolunteers() {
@@ -419,6 +459,141 @@ function clearDangerTimer() {
   }
 }
 
+
+function stopBackendPolling() {
+  if (backendPollTimer) clearInterval(backendPollTimer)
+  backendPollTimer = null
+}
+
+function cacheActiveTask(id) {
+  uni.setStorageSync(STORAGE_KEY, {
+    taskId: id,
+    active: true,
+    createdAt: Date.now()
+  })
+}
+
+function getOpenid() {
+  const user = uni.getStorageSync('user') || uni.getStorageSync('userInfo') || {}
+  return user.openid || user.username || user.id || 'user_001'
+}
+
+function normalizeBackendVolunteer(v = {}, fallback = {}) {
+  const rawId = v.id ?? fallback.id ?? 0
+  const numericId = Number(rawId)
+  const id = Number.isNaN(numericId) ? rawId : numericId
+  const status = v.status || fallback.status || '待响应'
+  const progress = Number(v.progress ?? fallback.progress ?? 0)
+  const isReal = Boolean(v.isReal ?? v.is_real ?? fallback.isReal)
+  const profile = uni.getStorageSync(VOLUNTEER_PROFILE_KEY) || {}
+  const role = getVolunteerRole({
+    ...fallback,
+    ...v,
+    isReal,
+    role: v.role || fallback.role || fallback.job
+  })
+  return {
+    ...fallback,
+    ...v,
+    id,
+    name: v.name || fallback.name || `志愿者${id}`,
+    username: v.username || fallback.username || v.name || fallback.name || `志愿者${id}`,
+    phone: v.phone || fallback.phone || '',
+    role,
+    age: v.age || fallback.age || 45,
+    job: isReal ? (profile.job || role) : (v.job || v.occupation || fallback.job || role),
+    honor: v.honor || fallback.honor || '社区互助成员',
+    isSelf: Boolean(v.isSelf ?? fallback.isSelf),
+    status,
+    progress,
+    etaText: v.etaText || v.eta_text || fallback.etaText || '待响应',
+    latitude: Number(v.latitude ?? fallback.latitude ?? CENTER.latitude),
+    longitude: Number(v.longitude ?? fallback.longitude ?? CENTER.longitude),
+    initLatitude: Number(v.initLatitude ?? fallback.initLatitude ?? v.latitude ?? fallback.latitude ?? CENTER.latitude),
+    initLongitude: Number(v.initLongitude ?? fallback.initLongitude ?? v.longitude ?? fallback.longitude ?? CENTER.longitude),
+    startLatitude: Number(v.startLatitude ?? fallback.startLatitude ?? v.latitude ?? fallback.latitude ?? CENTER.latitude),
+    startLongitude: Number(v.startLongitude ?? fallback.startLongitude ?? v.longitude ?? fallback.longitude ?? CENTER.longitude),
+    moveStartAt: Number(v.moveStartAt ?? v.move_start_at ?? fallback.moveStartAt ?? 0),
+    moveDurationSec: Number(v.moveDurationSec ?? v.move_duration_sec ?? fallback.moveDurationSec ?? 30),
+    autoRespondAt: Number(v.autoRespondAt ?? fallback.autoRespondAt ?? 0),
+    userId: v.userId || v.user_id || fallback.userId,
+    isReal
+  }
+}
+
+function getVolunteerRole(item = {}) {
+  if (item.isReal) {
+    const profile = uni.getStorageSync(VOLUNTEER_PROFILE_KEY) || {}
+    return profile.job ? `流动志愿者 · ${profile.job}` : '流动志愿者'
+  }
+  if (item.name === '王秀兰') return '地区常驻志愿者 · 网格员'
+  if (item.name === '李秋芳') return '地区常驻志愿者 · 保安'
+  if (item.role === ['真', '实', '志', '愿', '者'].join('')) return '流动志愿者'
+  return item.role || item.job || item.honor || '流动志愿者'
+}
+
+function normalizeBackendContacts(list = []) {
+  if (!Array.isArray(list) || !list.length) return defaultEmergencyContacts()
+  return list.map((c, index) => ({
+    id: c.id || index + 1,
+    name: c.name || `联系人${index + 1}`,
+    relation: c.relation || '紧急联系人',
+    phone: c.phone || '',
+    notified: c.status === '发送成功' || Boolean(c.notified),
+    notifyTime: c.notifyTime || c.notify_time || '',
+    status: c.status || '待发送'
+  }))
+}
+
+function mergeBackendStatusToLocal(data) {
+  const raw = uni.getStorageSync(STORAGE_KEY)
+  const local = normalizeState(raw)
+  const base = defaultVolunteers()
+  const backendVolunteers = Array.isArray(data.volunteers) ? data.volunteers : []
+
+  local.taskId = data.taskId || local.taskId
+  local.active = true
+  local.taskSource = data.taskSource || local.taskSource
+  local.systemStatus = data.systemStatus || local.systemStatus
+  local.requesterPosition = data.requesterPosition || local.requesterPosition
+  local.locationLabel = data.locationLabel || local.locationLabel
+  local.riskValue = typeof data.riskValue === 'number' ? data.riskValue : local.riskValue
+  local.emergencyMode = true
+  local.emergencyStartedAt = data.emergencyStartedAt || local.emergencyStartedAt
+  local.emergencyTriggerType = data.emergencyTriggerType || local.emergencyTriggerType
+  local.emergencyContacts = normalizeBackendContacts(data.emergencyContacts || local.emergencyContacts)
+  local.volunteers = backendVolunteers.map((backendFound, index) => {
+    const fallback = base.find((v) => Number(v.id) === Number(backendFound.id)) || base[index] || {}
+    const localFound = local.volunteers.find((v) => Number(v.id) === Number(backendFound.id)) || fallback
+    const mergedFallback = { ...fallback, ...localFound }
+
+    const normalized = normalizeBackendVolunteer(backendFound, mergedFallback)
+    return normalized
+  })
+
+  recomputeStatus(local)
+  saveState(local)
+  updateViewByState(local)
+}
+
+async function fetchBackendStatus(taskId) {
+  if (!taskId) return
+  try {
+    const res = await request(`/api/sos/status/${taskId}`)
+    console.log('SOS状态轮询：', res)
+    if (res && res.success && res.data) mergeBackendStatusToLocal(res.data)
+  } catch (e) {
+    console.log('后端状态同步失败：', e)
+  }
+}
+
+function startBackendPolling(taskId) {
+  stopBackendPolling()
+  if (!taskId) return
+  fetchBackendStatus(taskId)
+  backendPollTimer = setInterval(() => fetchBackendStatus(taskId), 1000)
+}
+
 function startEmergencyClock() {
   if (emergencyClockTimer) clearInterval(emergencyClockTimer)
   emergencyClockTimer = setInterval(() => {
@@ -444,9 +619,9 @@ function offsetById(id) {
 
 function normalizeState(raw) {
   const base = defaultVolunteers()
-  if (!raw || !Array.isArray(raw.volunteers)) {
+  if (!raw || raw.active !== true || !raw.taskId) {
     return {
-      taskId: '',
+      taskId: null,
       taskSource: '',
       alertState: 'none',
       systemStatus: 'idle',
@@ -457,24 +632,26 @@ function normalizeState(raw) {
       emergencyStartedAt: 0,
       emergencyTriggerType: '',
       emergencyContacts: defaultEmergencyContacts(),
-      volunteers: base,
+      volunteers: [],
       updatedAt: Date.now()
     }
   }
-  const volunteersData = base.map((item) => {
-    const found = raw.volunteers.find((v) => v.id === item.id) || {}
-    return { ...item, ...found }
+  const incomingVolunteers = Array.isArray(raw.volunteers) ? raw.volunteers : []
+  const volunteersData = incomingVolunteers.map((item, index) => {
+    const fallback = base.find((v) => Number(v.id) === Number(item.id)) || base[index] || {}
+    return { ...fallback, ...item }
   })
   return {
-    taskId: raw.taskId || '',
+    taskId: raw.taskId || null,
+    active: true,
     taskSource: raw.taskSource || '',
     alertState: raw.alertState || 'none',
-    systemStatus: raw.systemStatus || 'idle',
+    systemStatus: raw.systemStatus || 'sos',
     requesterPosition: raw.requesterPosition || { ...CENTER },
     locationLabel: raw.locationLabel || '村东侧小路口（演示定位）',
-    riskValue: typeof raw.riskValue === 'number' ? raw.riskValue : 15,
-    emergencyMode: !!raw.emergencyMode,
-    emergencyStartedAt: raw.emergencyStartedAt || 0,
+    riskValue: typeof raw.riskValue === 'number' ? raw.riskValue : 85,
+    emergencyMode: raw.emergencyMode === undefined ? true : !!raw.emergencyMode,
+    emergencyStartedAt: raw.emergencyStartedAt || raw.createdAt || Date.now(),
     emergencyTriggerType: raw.emergencyTriggerType || '',
     emergencyContacts: normalizeEmergencyContacts(raw.emergencyContacts || []),
     volunteers: volunteersData,
@@ -578,12 +755,14 @@ function updateViewByState(state) {
   mapCenter.value = { ...state.requesterPosition }
   locationLabel.value = state.locationLabel
   riskValue.value = state.riskValue
-  volunteers.value = deepClone(state.volunteers)
+  taskId.value = state.taskId || null
+  volunteers.value = state.taskId ? deepClone(state.volunteers || []) : []
+  console.log('首页志愿者列表：', volunteers.value)
   systemStatus.value = state.systemStatus
-  showVolunteerPanel.value = !!state.taskId
+  showVolunteerPanel.value = !!state.taskId && !!state.emergencyMode
   currentTaskSource.value = state.taskSource || ''
 
-  isEmergencyMode.value = !!state.emergencyMode
+  isEmergencyMode.value = !!state.emergencyMode && !!state.taskId
   emergencyTriggerType.value = state.emergencyTriggerType || ''
   emergencyStartedAt.value = state.emergencyStartedAt || 0
   emergencyContacts.value = normalizeEmergencyContacts(state.emergencyContacts || [])
@@ -600,46 +779,95 @@ function updateViewByState(state) {
 function syncStateAndTick() {
   const raw = uni.getStorageSync(STORAGE_KEY)
   const state = normalizeState(raw)
-  const changed = applyAutoRules(state, Date.now())
   if (isDangerSimulation.value && !state.taskId) return
   updateViewByState(state)
-  if (changed) saveState(state)
+  if (state.taskId && !backendPollTimer) startBackendPolling(state.taskId)
   applyVoiceScheduleTick()
 }
 
-function createSosTask(sourceText, taskSource = 'manual') {
+async function createSosTask(sourceText, taskSource = 'manual') {
+  if (isCreatingSOS.value || taskId.value) return false
+  isCreatingSOS.value = true
   const now = Date.now()
+  let backendTaskId = ''
+  let backendData = null
+  const openid = uni.getStorageSync('openid') || 'user_001'
+
+  try {
+    const res = await request('/api/sos/create', 'POST', {
+      openid,
+      position: {
+        latitude: myPosition.value.latitude,
+        longitude: myPosition.value.longitude
+      },
+      locationLabel: locationLabel.value || '当前位置',
+      taskSource: 'manual'
+    })
+    console.log('SOS创建结果：', res)
+
+    if (res && res.success === true && res.data && res.data.taskId) {
+      backendTaskId = res.data.taskId
+      addLog(`后端已创建 SOS 任务：${backendTaskId}`)
+      try {
+        const statusRes = await request(`/api/sos/status/${backendTaskId}`)
+        if (statusRes && statusRes.success) backendData = statusRes.data
+      } catch (_) {
+        /* 首次状态获取失败也不影响本地演示 */
+      }
+    } else {
+      addLog('后端创建 SOS 任务失败')
+      uni.showToast({ title: res?.message || 'SOS 创建失败', icon: 'none' })
+      endEmergencyMode()
+      isCreatingSOS.value = false
+      return false
+    }
+  } catch (e) {
+    console.log('创建 SOS 后端任务失败：', e)
+    addLog('无法连接后端，SOS 创建失败')
+    uni.showToast({ title: 'SOS 创建失败', icon: 'none' })
+    endEmergencyMode()
+    isCreatingSOS.value = false
+    return false
+  }
+
   const data = {
-    taskId: `task_${now}`,
+    taskId: backendTaskId,
+    active: true,
     taskSource,
     alertState: 'pending',
     systemStatus: 'sos',
-    requesterPosition: { ...myPosition.value },
-    locationLabel: locationLabel.value,
-    riskValue: 85,
-    emergencyMode: isEmergencyMode.value,
-    emergencyStartedAt: emergencyStartedAt.value,
-    emergencyTriggerType: emergencyTriggerType.value,
-    emergencyContacts: deepClone(emergencyContacts.value),
-    volunteers: defaultVolunteers(),
+    requesterPosition: backendData?.requesterPosition || { ...myPosition.value },
+    locationLabel: backendData?.locationLabel || locationLabel.value,
+    riskValue: typeof backendData?.riskValue === 'number' ? backendData.riskValue : 85,
+    emergencyMode: true,
+    emergencyStartedAt: backendData?.emergencyStartedAt || emergencyStartedAt.value || now,
+    emergencyTriggerType: backendData?.emergencyTriggerType || emergencyTriggerType.value,
+    emergencyContacts: normalizeEmergencyContacts(backendData?.emergencyContacts || emergencyContacts.value),
+    volunteers: [],
     updatedAt: now
   }
 
-  data.volunteers.forEach((v) => {
-    if (v.isSelf) return
-    const shouldRespond = Math.random() > 0.2
-    if (!shouldRespond) return
-    const delaySec = Math.floor(Math.random() * 6) + 2
-    const durationSec = Math.floor(Math.random() * 26) + 18
-    v.autoRespondAt = now + delaySec * 1000
-    v.moveDurationSec = durationSec
-  })
+  if (Array.isArray(backendData?.volunteers) && backendData.volunteers.length) {
+    const base = defaultVolunteers()
+    data.volunteers = base.map((item) => {
+      const found = backendData.volunteers.find((v) => Number(v.id) === Number(item.id))
+      return normalizeBackendVolunteer(found, item)
+    })
+  }
 
   saveState(data)
+  cacheActiveTask(backendTaskId)
   updateViewByState(data)
   addLog(sourceText)
   addLog('已向附近志愿者广播求助')
   uni.showToast({ title: 'SOS 已发送', icon: 'none' })
+
+  taskId.value = backendTaskId
+  isEmergencyMode.value = true
+  showVolunteerPanel.value = true
+  startBackendPolling(backendTaskId)
+  isCreatingSOS.value = false
+  return true
 }
 
 function startEmergencyMode(sourceLabel) {
@@ -701,8 +929,8 @@ function endEmergencyMode() {
   currentTaskSource.value = ''
 }
 
-function triggerSOS(source = 'manual') {
-  if (showVolunteerPanel.value || isEmergencyMode.value) {
+async function triggerSOS(source = 'manual') {
+  if (isCreatingSOS.value || showVolunteerPanel.value || isEmergencyMode.value) {
     uni.showToast({ title: '已处于紧急流程中', icon: 'none' })
     return
   }
@@ -711,20 +939,26 @@ function triggerSOS(source = 'manual') {
   isDangerSimulation.value = false
   clearDangerTimer()
   startEmergencyMode(taskSource)
-  createSosTask(source === 'manual' ? '用户手动触发 SOS' : '系统自动触发 SOS', taskSource)
+  const created = await createSosTask(source === 'manual' ? '用户手动触发 SOS' : '系统自动触发 SOS', taskSource)
+  if (!created) return
   notifyEmergencyContacts()
 }
 
 function resetAll() {
+  stopBackendPolling()
   clearContactNotifyTimers()
   stopEmergencyClock()
   clearDangerTimer()
+  stopVoiceModelDetect(true)
   isDangerSimulation.value = false
   listeningFromSchedule.value = false
   const idle = normalizeState(null)
-  saveState(idle)
+  uni.removeStorageSync(STORAGE_KEY)
   updateViewByState(idle)
   endEmergencyMode()
+  taskId.value = null
+  showVolunteerPanel.value = false
+  volunteers.value = []
   riskValue.value = 15
   isListening.value = false
   protectionMode.value = false
@@ -732,12 +966,12 @@ function resetAll() {
   logs.value = ['场景已重置，可再次开始演示']
 }
 
-function handleManualSOS() {
+async function handleManualSOS() {
   riskValue.value = 85
-  triggerSOS('manual')
+  await triggerSOS('manual')
 }
 
-function handleCancelSOS() {
+async function handleCancelSOS() {
   const raw = uni.getStorageSync(STORAGE_KEY)
   const state = normalizeState(raw)
 
@@ -749,6 +983,12 @@ function handleCancelSOS() {
   if (state.taskSource !== 'manual') {
     uni.showToast({ title: '仅可取消手动 SOS', icon: 'none' })
     return
+  }
+
+  try {
+    await request(`/api/sos/cancel/${state.taskId}`, 'POST', { openid: getOpenid() })
+  } catch (e) {
+    console.log('后端取消 SOS 失败，本地继续取消：', e)
   }
 
   resetAll()
@@ -839,6 +1079,7 @@ function clearVoiceSlots() {
     isListening.value = false
     protectionMode.value = false
     listeningFromSchedule.value = false
+    stopVoiceModelDetect(true)
   }
   uni.showToast({ title: '已清空监测时间点', icon: 'none' })
 }
@@ -846,6 +1087,162 @@ function clearVoiceSlots() {
 function goVoiceTest() {
   uni.navigateTo({
     url: '/pages/voice-test/voice-test',
+    fail: () => uni.showToast({ title: '页面打开失败', icon: 'none' })
+  })
+}
+
+function startVoiceModelDetect(fromSchedule = false) {
+  if (voiceModelRunning.value) return
+  if (isEmergencyMode.value || showVolunteerPanel.value) {
+    uni.showToast({ title: '当前已在 SOS 流程中', icon: 'none' })
+    return
+  }
+
+  try {
+    recorderManager = recorderManager || uni.getRecorderManager()
+  } catch (e) {
+    console.log('录音管理器初始化失败：', e)
+    uni.showToast({ title: '当前环境不支持录音', icon: 'none' })
+    return
+  }
+
+  voiceModelRunning.value = true
+  isListening.value = true
+  protectionMode.value = true
+  systemStatus.value = 'listening'
+  console.log('开始语音监听')
+  addLog(fromSchedule ? '语音模型监听已按计划开启' : '语音模型监听已手动开启')
+
+  if (!recorderEventsBound) {
+    recorderEventsBound = true
+    recorderManager.onStop((res) => {
+      if (!voiceModelRunning.value) return
+
+      if (res && res.tempFilePath) {
+        console.log('录音文件路径：', res.tempFilePath)
+        uploadVoiceChunk(res.tempFilePath)
+      } else {
+        addLog('录音片段为空，已跳过本次识别')
+      }
+
+      setTimeout(() => {
+        if (voiceModelRunning.value) recordVoiceChunk()
+      }, 300)
+    })
+
+    recorderManager.onError((err) => {
+      console.log('录音失败：', err)
+      addLog('语音监听失败：请检查麦克风权限')
+      stopVoiceModelDetect(true)
+      uni.showToast({ title: '录音失败，请检查麦克风权限', icon: 'none' })
+    })
+  }
+
+  recordVoiceChunk()
+}
+
+function stopVoiceModelDetect(silent = false) {
+  if (!voiceModelRunning.value && !isListening.value) return
+
+  voiceModelRunning.value = false
+  voiceModelUploading.value = false
+
+  try {
+    if (recorderManager) recorderManager.stop()
+  } catch (_) {
+    /* ignore */
+  }
+
+  if (!listeningFromSchedule.value && !isEmergencyMode.value && !showVolunteerPanel.value) {
+    isListening.value = false
+    if (systemStatus.value === 'listening') systemStatus.value = 'idle'
+  }
+
+  if (!silent) {
+    console.log('停止语音监听')
+    addLog('语音模型监听已关闭')
+    uni.showToast({ title: '语音监听已关闭', icon: 'none' })
+  } else {
+    console.log('停止语音监听')
+  }
+}
+
+function recordVoiceChunk() {
+  if (!voiceModelRunning.value || !recorderManager) return
+
+  try {
+    recorderManager.start({
+      duration: 3000,
+      sampleRate: 16000,
+      numberOfChannels: 1,
+      encodeBitRate: 96000,
+      format: 'wav'
+    })
+  } catch (e) {
+    console.log('开始录音失败：', e)
+    addLog('开始录音失败，请检查录音权限')
+    stopVoiceModelDetect(true)
+  }
+}
+
+function uploadVoiceChunk(filePath) {
+  if (!voiceModelRunning.value || voiceModelUploading.value) return
+  voiceModelUploading.value = true
+
+  uni.uploadFile({
+    url: VOICE_API_URL,
+    filePath,
+    name: 'audio_file',
+    success: (res) => {
+      console.log('上传成功：', res)
+      let data = null
+      try {
+        data = typeof res.data === 'string' ? JSON.parse(res.data) : res.data
+      } catch (e) {
+        console.log('语音模型返回解析失败：', res.data)
+        addLog('语音模型返回解析失败')
+        return
+      }
+
+      const text = String(data?.text || '').replace(/\s/g, '')
+      console.log('后端识别文本：', text)
+      console.log('detected 是否为 true：', data?.detected === true)
+      if (text) addLog(`语音模型识别：${text}`)
+
+      if (data?.detected === true) {
+        handleVoiceModelDetected(text)
+      }
+    },
+    fail: (err) => {
+      console.log('语音上传失败：', err)
+      addLog('语音上传失败：请检查语音后端地址和同一局域网')
+    },
+    complete: () => {
+      voiceModelUploading.value = false
+    }
+  })
+}
+
+async function handleVoiceModelDetected(text = '') {
+  const now = Date.now()
+  if (now - voiceModelLastSosAt.value < 15000) {
+    addLog('已识别到求救语音，处于 15 秒冷却中，避免重复触发')
+    return
+  }
+  voiceModelLastSosAt.value = now
+
+  addLog(`检测到求救语音${text ? `「${text}」` : ''}，系统自动触发 SOS`)
+  uni.showToast({ title: '检测到求救语音，正在触发 SOS', icon: 'none' })
+
+  stopVoiceModelDetect(true)
+  riskValue.value = Math.max(riskValue.value, 85)
+  await triggerSOS('auto')
+  console.log('已触发 SOS')
+}
+
+function goTutorial() {
+  uni.navigateTo({
+    url: '/pages/tutorial/tutorial',
     fail: () => uni.showToast({ title: '页面打开失败', icon: 'none' })
   })
 }
@@ -866,13 +1263,15 @@ function applyVoiceScheduleTick() {
       isListening.value = true
       protectionMode.value = true
       listeningFromSchedule.value = true
-      addLog('监测计划：当前时间在已选时段内，已自动开启语音监测')
+      addLog('监测计划：当前时间在已选时段内，已自动开启语音模型监听')
+      startVoiceModelDetect(true)
     }
   } else if (listeningFromSchedule.value) {
     isListening.value = false
     protectionMode.value = false
     listeningFromSchedule.value = false
-    addLog('监测计划：已离开计划时段，已结束自动语音监测')
+    stopVoiceModelDetect(true)
+    addLog('监测计划：已离开计划时段，已结束自动语音模型监听')
   }
 }
 
@@ -1016,30 +1415,34 @@ const mapMarkers = computed(() => {
     }
   }
 
-  const volunteerMarkers = volunteers.value.map((item) => {
-    const active = item.status !== '待响应'
+  const markers = [seekerMarker]
+  if (!isEmergencyMode.value || volunteers.value.length === 0) return markers
+
+  const volunteerMarkers = volunteers.value.map((item, index) => {
+    const active = item.status === '前往中'
+    const arrived = item.status === '已到达'
     return {
-      id: item.id,
+      id: index + 1,
       latitude: item.latitude,
       longitude: item.longitude,
-      width: active ? 20 : 18,
-      height: active ? 24 : 22,
-      zIndex: item.isSelf ? 20 : 10,
+      width: active || arrived ? 22 : 18,
+      height: active || arrived ? 26 : 22,
+      zIndex: item.isReal ? 30 : 10,
       anchor: { x: 0.5, y: 1 },
-      iconPath: active ? '/static/volunteer-green.png' : '/static/volunteer-blue.png',
+      iconPath: active || arrived ? '/static/volunteer-green.png' : '/static/volunteer-blue.png',
       callout: {
         content: `${item.name}｜${item.status} ${item.progress}%`,
         color: '#ffffff',
         fontSize: 10,
         borderRadius: 8,
-        bgColor: active ? '#22b573' : '#2d6cff',
+        bgColor: arrived ? '#ff8a00' : active ? '#22b573' : '#2d6cff',
         padding: 6,
-        display: item.isSelf ? 'ALWAYS' : 'BYCLICK'
+        display: item.isReal ? 'ALWAYS' : 'BYCLICK'
       }
     }
   })
 
-  return [...volunteerMarkers, seekerMarker]
+  return [...markers, ...volunteerMarkers]
 })
 
 const mapCircles = computed(() => {
@@ -1064,7 +1467,23 @@ const mapCircles = computed(() => {
   return [...grayCircles, ...redCircles]
 })
 
+function ensureLogin() {
+  const token = uni.getStorageSync('token')
+  if (!token) {
+    uni.reLaunch({
+      url: '/pages/login/login'
+    })
+    return false
+  }
+  return true
+}
+
+onLoad(() => {
+  ensureLogin()
+})
+
 onMounted(() => {
+  if (!ensureLogin()) return
   loadVoiceSlots()
   resetEmergencyContacts()
   startWaveAnimation()
@@ -1073,19 +1492,24 @@ onMounted(() => {
 })
 
 onShow(() => {
+  if (!ensureLogin()) return
   syncStateAndTick()
   startSync()
 })
 
 onHide(() => {
   stopSync()
+  stopBackendPolling()
+  stopVoiceModelDetect(true)
 })
 
 onUnmounted(() => {
   stopSync()
+  stopBackendPolling()
   clearContactNotifyTimers()
   clearDangerTimer()
   stopEmergencyClock()
+  stopVoiceModelDetect(true)
   if (waveTimer) clearInterval(waveTimer)
 })
 </script>
@@ -1199,6 +1623,13 @@ onUnmounted(() => {
   font-size: 22rpx;
   line-height: 1.55;
   color: #6d7890;
+}
+
+.voice-entry-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12rpx;
+  flex-shrink: 0;
 }
 
 .voice-entry-btn {
@@ -1587,6 +2018,12 @@ onUnmounted(() => {
   color: #e63b47;
   font-size: 28rpx;
   font-weight: 700;
+}
+
+.tutorial-pill {
+  border-color: #ffd9c8;
+  color: #d95b3d;
+  background: #fff7f2;
 }
 
 .panel {

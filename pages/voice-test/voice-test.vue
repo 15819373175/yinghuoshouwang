@@ -12,6 +12,8 @@
 
 <script>
 const recorderManager = uni.getRecorderManager()
+const VOICE_DETECT_URL = 'http://192.168.43.66:8000/api/detect'
+const VOICE_DOCS_URL = 'http://192.168.43.66:8000/docs'
 
 export default {
   data() {
@@ -19,7 +21,7 @@ export default {
       statusText: '等待开始',
       detectText: '',
       filePath: '',
-      serverUrl: 'http://192.168.43.66:8000/api/detect'
+      serverUrl: VOICE_DETECT_URL
     }
   },
 
@@ -28,7 +30,7 @@ export default {
       this.statusText = '正在测试接口连通...'
 
       uni.request({
-        url: 'http://192.168.43.66:8000/docs',
+        url: VOICE_DOCS_URL,
         method: 'GET',
         success: (res) => {
           console.log('request success:', res)
@@ -68,6 +70,7 @@ export default {
         name: 'audio_file',
         success: (res) => {
           console.log('upload response:', res)
+          console.log('语音模型返回 =', res.data)
 
           // 先判断 HTTP 状态码
           if (res.statusCode !== 200) {
